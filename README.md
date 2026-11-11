@@ -1,4 +1,6 @@
 # 黄果解析站
+# 好用的话给DR点个Star好吗秋梨膏！
+# 到底是谁在用爬虫爬我这里数据 后端接口要爆了宝宝，你去爬源站不好吗，已加反爬
 
 基于 [jinshengchan/huangguo-fongmi](https://github.com/jinshengchan/huangguo-fongmi) 与 [cluntop/tvbox](https://github.com/cluntop/tvbox)（`js/ss/huangguo.py`、`js/ss/huangguo2.py`）的适配逻辑实现。前端部署到 GitHub Pages，API 与跨域代理部署到 Cloudflare Workers 免费档。
 
@@ -116,3 +118,67 @@ npx wrangler deploy
 ```
 
 站点内容来自第三方公开站点，使用者需自行遵守当地法律法规与版权规则。
+## 2026-11-11 重大更新：源站迁移 + 加密接口
+
+### 源站域名变更
+
+`huangguoai.com` 已不可达，DNS 被污染到 Facebook 网段，直连与 DoH 均超时。
+官方入口页 `huangguoai.ai` 公布的新地址中，**`huangguoai.io` 接口结构完全一致**，已改为主用。
+封面 CDN 也从 `pic.wirqed.cn` 换成了 `pic.drleao.cn`，AES-CBC 解密逻辑不变。
+
+### 接口全面加密：dx150-edge-v1
+
+站点 2026-11-09 起把业务接口迁到加密通道，旧的 `/api/videos/{id}/play` 返回的 `video_url` 恒为空，
+这正是「解析不了」的直接原因。协议如下：
+
+1. 握手 `POST /api/playback/request`，body 为 `{v:1, type:'hello', client_pub:<base64url ECDH P-256 公钥>}`
+2. 服务端返回 `server_pub`、`salt`、`kid`、`sid`、`server_time`、`expires_at`
+3. ECDH 协商出共享密钥，经 HKDF-SHA256 按 `dx150-edge-v1\n<scope>\n<site>\n<kid>\n<sid>\n<req|res>` 派生双向 AES-GCM 密钥
+4. 业务请求封装为 `{method, path, body:<base64>, content_type, visitor_id}`，加密后包成
+   `{v:1, type:'call', kid, sid, seq, ts, ciphertext}` 发出，响应同样加密返回内层 HTTP 结果
+
+**播放地址的正确取法**：`POST /api/videos/{id}/episodes/{ep}/playback`，解密后得到
+`data.streams.main`，实测第 1 集 240 秒 / 42 分片，带 `via_m=dx150` 签名。
+
+### 多 Worker 分流
+
+部署了 3 个功能完全相同的 Worker，前端按「轮询起点 + 失败自动切换」分散请求：
+
+| Worker | 地址 |
+|---|---|
+| 主 | https://huangguo-parser.13681235735.workers.dev |
+| 2 | https://hg-parser-2.13681235735.workers.dev |
+| 3 | https://hg-parser-3.13681235735.workers.dev |
+
+`app.js` 里的 `API_ENDPOINTS` 数组维护这份清单，某个端点失败会记冷却时间并自动跳过，
+封面图片用「最近一次成功的端点」拼接，避免全部压在同一个 Worker 上。
+
+## 本地预览
+
+```bash
+python -m http.server 8080
+```
+
+## Worker 部署
+
+```bash
+npx wrangler deploy
+```
+
+站点内容来自第三方公开站点，使用者需自行遵守当地法律法规与版权规则。
+
+## 反爬防护
+
+爬虫直接打 API 会迅速耗尽 Worker 免费档每天 10 万次请求，因此加了三层防护，全部在 Worker 的 `handle` 入口执行。
+
+**第一层 浏览器指纹**。检查 `User-Agent`、`Referer`、`Origin`、`Sec-Fetch-*`。明确的脚本特征直接拒绝，包括 `curl`、`wget`、`python-requests`、`aiohttp`、`httpx`、`scrapy`、`go-http-client`、`okhttp`、`node-fetch`、`undici`、`postmanruntime`，以及 `headlesschrome`、`puppeteer`、`playwright`、`selenium`。浏览器跨域请求必然带 Referer 或 Origin，纯脚本客户端通常没有。
+
+**第二层 时间窗口 HMAC**。前端每次请求生成 `X-HG-Ts` 与 `X-HG-Sig`，签名内容是 `窗口号 + path + query`，窗口 5 分钟，前后各容忍一个窗口。爬虫必须真正执行 JS 并复刻签名算法才能通过。密钥写在前端，目的是挡住不执行 JS 的批量脚本，不是对抗有意的逆向。
+
+**第三层 Cache API**。读接口按内容类型缓存，命中后直接返回不打源站：分类 5 分钟、排行榜 10 分钟、话题与吃瓜 15 分钟、详情 10 分钟、搜索 3 分钟、健康检查 1 小时。播放地址因签名有时效不缓存。
+
+**免防护路径**：`/api/` 与 `/api/categories` 用于探活和枚举，不含业务数据，不校验签名；`/media`、`/raw`、`/hls.js` 由 `<img>` 与 `<video>` 直接发起，不带自定义头，也不设防。
+
+**实测结果**：正常浏览器五项接口全部 200；无签名、python-requests、curl、headless、无 Referer 五种爬虫场景全部 403；过期签名返回 `sig:expired`。
+
+注意 `CORS` 需要放行 `X-HG-Ts` 与 `X-HG-Sig`，否则浏览器预检会失败，这是最容易漏的一环。
